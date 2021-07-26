@@ -15,16 +15,12 @@ public class ChunkWriter {
     private final int blockSize;
 
     @Nonnull
-    private final Pool<BlockBuffer> blockPool;
-
-    @Nonnull
     private final BlockWriter blockWriter;
 
-    private final int maxChunkDataSize;
-
-    private BlockBuffer blockBuffer;
-
+    @Nonnull
     private ByteBuffer byteBuffer;
+
+    private final int maxChunkDataSize;
 
     private boolean pending;
 
@@ -40,11 +36,11 @@ public class ChunkWriter {
 
     private boolean hasLast;
 
-    public ChunkWriter(int blockSize, @Nonnull Pool<BlockBuffer> blockPool, @Nonnull BlockWriter blockWriter) {
-        this(blockSize, blockPool, blockWriter, MAX_CHUNK_DATA_SIZE);
+    public ChunkWriter(int blockSize, @Nonnull BlockWriter blockWriter, @Nonnull ByteBuffer byteBuffer) {
+        this(blockSize, blockWriter, byteBuffer, MAX_CHUNK_DATA_SIZE);
     }
 
-    public ChunkWriter(int blockSize, @Nonnull Pool<BlockBuffer> blockPool, @Nonnull BlockWriter blockWriter,
+    public ChunkWriter(int blockSize, @Nonnull BlockWriter blockWriter, @Nonnull ByteBuffer byteBuffer,
             int maxChunkDataSize) {
 
         if (maxChunkDataSize < 1) {
@@ -55,15 +51,18 @@ public class ChunkWriter {
             throw new IllegalArgumentException();
         }
 
-        this.maxChunkDataSize = maxChunkDataSize;
-
         if (blockSize < 23) {
             throw new IllegalArgumentException();
         }
 
+        if (byteBuffer.capacity() != blockSize) {
+            throw new IllegalArgumentException();
+        }
+
         this.blockSize = blockSize;
-        this.blockPool = requireNonNull(blockPool);
         this.blockWriter = requireNonNull(blockWriter);
+        this.byteBuffer = byteBuffer;
+        this.maxChunkDataSize = maxChunkDataSize;
         clearChunk();
     }
 
@@ -121,12 +120,7 @@ public class ChunkWriter {
             throw new IllegalStateException();
         }
 
-        if (byteBuffer == null) {
-            blockBuffer = blockPool.borrow();
-            byteBuffer = blockBuffer.getWriterByteBuffer();
-        } else {
-            updatePosition();
-        }
+        updatePosition();
 
         byteBuffer.putLong(chunkHeaderPosition, -sequence);
         fillChunk();
@@ -136,20 +130,15 @@ public class ChunkWriter {
         final var bufferRemaining = blockSize - chunkDataEnd - 4;
         if (bufferRemaining < 22) {
             sendFinal(bufferRemaining);
-            clearChunk();
-            blockBuffer = null;
-            byteBuffer = null;
         } else {
             nextChunk();
-            byteBuffer.limit(chunkDataMax);
-            byteBuffer.position(chunkDataEnd);
         }
     }
 
     public void endOfBatch() throws InterruptedException {
 
         if (hasLast) {
-            blockWriter.partialBlock(sequence, offset, pending, blockBuffer, chunkHeaderPosition);
+            blockWriter.partialBlock(sequence, offset, pending, chunkHeaderPosition);
             hasLast = false;
         }
     }
@@ -161,32 +150,22 @@ public class ChunkWriter {
             throw new IllegalStateException();
         }
 
-        if (byteBuffer == null) {
-            blockBuffer = blockPool.borrow();
-            byteBuffer = blockBuffer.getWriterByteBuffer();
-        } else {
-            updatePosition();
+        updatePosition();
 
-            if (chunkDataEnd < chunkDataMax) {
-                return byteBuffer;
-            }
-
-            byteBuffer.putLong(chunkHeaderPosition, sequence);
-            fillChunk();
-
-            final var bufferRemaining = blockSize - chunkDataEnd - 4;
-            if (bufferRemaining > 22) {
-                nextChunk();
-            } else {
-                sendFinal(bufferRemaining);
-                clearChunk();
-                blockBuffer = blockPool.borrow();
-                byteBuffer = blockBuffer.getWriterByteBuffer();
-            }
+        if (chunkDataEnd < chunkDataMax) {
+            return byteBuffer;
         }
 
-        byteBuffer.limit(chunkDataMax);
-        byteBuffer.position(chunkDataEnd);
+        byteBuffer.putLong(chunkHeaderPosition, sequence);
+        fillChunk();
+
+        final var bufferRemaining = blockSize - chunkDataEnd - 4;
+        if (bufferRemaining > 22) {
+            nextChunk();
+        } else {
+            sendFinal(bufferRemaining);
+        }
+
         return byteBuffer;
     }
 
@@ -207,6 +186,7 @@ public class ChunkWriter {
     }
 
     private void fillChunk() {
+
         byteBuffer.putLong(chunkHeaderPosition + 8, offset);
         final var length = chunkDataEnd - chunkHeaderPosition - 18;
         offset += length;
@@ -220,19 +200,24 @@ public class ChunkWriter {
     }
 
     private void clearChunk() {
+
         hasLast = false;
         chunkHeaderPosition = 0;
         adjust();
     }
 
     private void nextChunk() {
+
         chunkHeaderPosition = chunkDataEnd + 4;
         adjust();
     }
 
     private void adjust() {
+
         chunkDataEnd = chunkHeaderPosition + 18;
         chunkDataMax = chunkDataEnd + Math.min(maxChunkDataSize, blockSize - chunkDataEnd - 4);
+        byteBuffer.limit(chunkDataMax);
+        byteBuffer.position(chunkDataEnd);
     }
 
     private void sendFinal(int remaining) throws InterruptedException {
@@ -254,6 +239,7 @@ public class ChunkWriter {
             byteBuffer.putLong(0);
         }
 
-        blockWriter.fullBlock(sequence, offset, pending, blockBuffer, remaining);
+        byteBuffer = blockWriter.fullBlock(sequence, offset, pending);
+        clearChunk();
     }
 }

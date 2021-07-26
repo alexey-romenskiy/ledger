@@ -1,12 +1,12 @@
 package codes.writeonce.ledger;
 
 import javax.annotation.Nonnull;
+import java.nio.ByteBuffer;
 
 public interface BlockWriter {
 
-    void fullBlock(long sequence, long offset, boolean pending, @Nonnull BlockBuffer blockBuffer, int remaining)
-            throws InterruptedException;
+    @Nonnull
+    ByteBuffer fullBlock(long sequence, long offset, boolean pending) throws InterruptedException;
 
-    void partialBlock(long sequence, long offset, boolean pending, @Nonnull BlockBuffer blockBuffer, int end)
-            throws InterruptedException;
+    void partialBlock(long sequence, long offset, boolean pending, int end) throws InterruptedException;
 }

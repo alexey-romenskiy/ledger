@@ -10,6 +10,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.TreeMap;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static com.sun.nio.file.ExtendedOpenOption.DIRECT;
 import static java.nio.file.StandardOpenOption.DSYNC;
@@ -30,7 +35,19 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
 
     private final int blockSize;
 
+    private final int poolSize;
+
     private final int maxConcurrentBlocks;
+
+    private final AtomicInteger nowConcurrentBlocks = new AtomicInteger();
+
+    private final AtomicInteger blocksBehind = new AtomicInteger();
+
+    private final AtomicInteger pendingBlockIndex = new AtomicInteger();
+
+    private final AtomicInteger runningBlockIndex = new AtomicInteger();
+
+    private final AtomicInteger pendingBlockCount = new AtomicInteger();
 
     private final int maxBehind;
 
@@ -44,6 +61,22 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
 
     private final TreeMap<Long, Operation> runningOperations = new TreeMap<>();
 
+    private final QueueItem[] pool;
+
+    private final AtomicInteger freeHead = new AtomicInteger();
+
+    private final AtomicInteger freeTail = new AtomicInteger();
+
+    private final AtomicInteger freeCount;
+
+    private final Lock lock = new ReentrantLock();
+
+    private final Condition condition = lock.newCondition();
+
+    private final Lock freeLock = new ReentrantLock();
+
+    private final Condition freeCondition = freeLock.newCondition();
+
     private final byte[] zeroedBlock;
 
     @Nonnull
@@ -54,7 +87,7 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
 
     private final long fileBlockLength;
 
-    private long freeBlockCount;
+    private final AtomicLong freeBlockCount;
 
     private long nextReadBlockOffset;
 
@@ -93,6 +126,33 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
         }
     };
 
+    private final CompletionHandler<Integer, QueueItem> handler2 = new CompletionHandler<>() {
+        @Override
+        public void completed(Integer result, QueueItem attachment) {
+
+            if (result == blockSize) {
+                try {
+                    complete(attachment);
+                } catch (Error e) {
+                    fail(e);
+                    throw e;
+                } catch (InterruptedException e) {
+                    fail(e);
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    fail(e);
+                }
+            } else {
+                fail(new IllegalStateException("Result is " + result));
+            }
+        }
+
+        @Override
+        public void failed(Throwable throwable, QueueItem attachment) {
+            fail(throwable);
+        }
+    };
+
     public static void main(String[] args) throws InterruptedException, IOException {
 
         final var channel = AsynchronousFileChannel.open(Path.of(args[0]), DSYNC, READ, WRITE, DIRECT);
@@ -116,11 +176,12 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
             throws InterruptedException {
 
         this.blockSize = blockSize;
+        this.poolSize = buffersPoolSize;
         this.maxConcurrentBlocks = maxConcurrentBlocks;
         this.maxBehind = maxBehind;
         this.channel = channel;
         this.fileBlockLength = fileBlockLength;
-        this.freeBlockCount = fileBlockLength;
+        this.freeBlockCount = new AtomicLong(fileBlockLength);
         this.freeBuffers = new ArrayBlockingQueue<>(buffersPoolSize);
 
         this.zeroedBlock = new byte[blockSize];
@@ -130,17 +191,33 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
         final int addressModulus = wholeBuffer.alignmentOffset(0, blockSize);
         final int alignedPosition = addressModulus > 0 ? blockSize - addressModulus : 0;
 
+        pool = new QueueItem[buffersPoolSize];
+
         for (int i = 0; i < buffersPoolSize; i++) {
             final ByteBuffer byteBuffer = wholeBuffer.slice(alignedPosition + i * blockSize, blockSize);
             freeBuffers.put(new BlockBuffer(byteBuffer));
+            pool[i] = new QueueItem(i, byteBuffer);
         }
     }
 
+    @Nonnull
     @Override
-    public void fullBlock(long sequence, long offset, boolean pending, @Nonnull BlockBuffer blockBuffer, int remaining)
-            throws InterruptedException {
+    public ByteBuffer fullBlock(long sequence, long offset, boolean pending) throws InterruptedException {
 
-        blockBuffer.getReaderByteBuffer().clear();
+        final int nextItemIndex = borrow();
+
+        pendingBlockCount.incrementAndGet();
+
+        freeHead.set(nextItemIndex);
+
+        trySend();
+
+        nextWriteBlockOffset = (nextWriteBlockOffset + 1) % fileBlockLength;
+        final var q = pool[nextItemIndex];
+        q.fileBlockOffset = nextWriteBlockOffset;
+        return q.byteBuffer;
+
+        byteBuffer.clear();
 
         final var op1 =
                 new Operation(nextWriteBlockNumber, nextWriteBlockOffset, sequence, offset, pending, blockBuffer, true);
@@ -186,9 +263,172 @@ public class BlockDeviceWriter implements BlockWriter, AutoCloseable {
         }
     }
 
+    @Nonnull
+    private QueueItem borrow() throws InterruptedException {
+
+        while (true) {
+
+            var tail = freeTail.get();
+            var head = freeHead.get();
+            var next = (head + 1) % poolSize;
+
+            while (next != tail) {
+                if (freeHead.compareAndSet(head, next)) {
+                    return pool[next];
+                }
+                head = freeHead.get();
+                next = (head + 1) % poolSize;
+            }
+
+            freeLock.lock();
+            try {
+                tail = freeTail.get();
+                head = freeHead.get();
+                next = (head + 1) % poolSize;
+
+                if (next == tail) {
+                    freeCondition.await();
+                }
+            } finally {
+                freeLock.unlock();
+            }
+        }
+    }
+
+    private void reclaim(@Nonnull QueueItem queueItem) throws InterruptedException {
+
+        var tail = freeTail.get();
+        var head = freeHead.get();
+        var next = (head + 1) % poolSize;
+
+        if (next == tail) {
+
+            freeLock.lock();
+            try {
+                tail = freeTail.get();
+                head = freeHead.get();
+                next = (head + 1) % poolSize;
+
+                if (next == tail) {
+
+                    freeCondition.signal();
+                }
+            } finally {
+                freeLock.unlock();
+            }
+        }
+    }
+
+    private void completed(int n) {
+
+        while (true) {
+            final var i = runningBlockIndex.get();
+            if (i != n) {
+                break;
+            }
+            final var i2 = (i + 1) % poolSize;
+            if (runningBlockIndex.compareAndSet(i, i2)) {
+                return i;
+            }
+        }
+    }
+
+    private void trySend() {
+
+        if (checkPendingBlockCount()) {
+            if (checkFreeBlockCount()) {
+                if (checkMaxConcurrentBlocks()) {
+                    final var behind = checkMaxBehind();
+                    if (behind < maxBehind) {
+                        final var itemIndex = nextPendingBlockIndex();
+                        if (behind == 0) {
+                            runningBlockIndex.set(itemIndex);
+                        }
+                        final var queueItem = pool[itemIndex];
+                        channel.write(queueItem.byteBuffer, queueItem.fileBlockOffset * blockSize, queueItem, handler2);
+                        return;
+                    }
+                    nowConcurrentBlocks.decrementAndGet();
+                }
+                freeBlockCount.incrementAndGet();
+            }
+            pendingBlockCount.incrementAndGet();
+        }
+    }
+
+    private int nextPendingBlockIndex() {
+
+        while (true) {
+            final var i = pendingBlockIndex.get();
+            final var i2 = (i + 1) % poolSize;
+            if (pendingBlockIndex.compareAndSet(i, i2)) {
+                return i;
+            }
+        }
+    }
+
+    private boolean checkPendingBlockCount() {
+
+        while (true) {
+            final var c = pendingBlockCount.get();
+            if (c > 0) {
+                final var nc = c - 1;
+                if (pendingBlockCount.compareAndSet(c, nc)) {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    private boolean checkFreeBlockCount() {
+
+        while (true) {
+            final var c = freeBlockCount.get();
+            if (c > 0) {
+                final var nc = c - 1;
+                if (freeBlockCount.compareAndSet(c, nc)) {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    private boolean checkMaxConcurrentBlocks() {
+
+        while (true) {
+            final var c = nowConcurrentBlocks.get();
+            if (c < maxConcurrentBlocks) {
+                final var nc = c + 1;
+                if (nowConcurrentBlocks.compareAndSet(c, nc)) {
+                    return true;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    private int checkMaxBehind() {
+
+        while (true) {
+            final var c = blocksBehind.get();
+            if (c < maxBehind) {
+                final var nc = c + 1;
+                if (blocksBehind.compareAndSet(c, nc)) {
+                    return c;
+                }
+            } else {
+                return c;
+            }
+        }
+    }
+
     @Override
-    public void partialBlock(long sequence, long offset, boolean pending, @Nonnull BlockBuffer partialBuffer, int end)
-            throws InterruptedException {
+    public void partialBlock(long sequence, long offset, boolean pending, int end) throws InterruptedException {
 
         final var buffer = freeBuffers.take();
         if (buffer == POISON) {

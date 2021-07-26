@@ -6,23 +6,23 @@ import java.nio.ByteBuffer;
 public class BlockBuffer {
 
     @Nonnull
-    private final ByteBuffer writerByteBuffer;
+    private final ByteBuffer byteBuffer;
 
     @Nonnull
-    private final ByteBuffer readerByteBuffer;
+    private final ByteBuffer duplicateByteBuffer;
 
     public BlockBuffer(@Nonnull ByteBuffer writerByteBuffer) {
-        this.writerByteBuffer = writerByteBuffer;
-        this.readerByteBuffer = writerByteBuffer.duplicate();
+        this.byteBuffer = writerByteBuffer;
+        this.duplicateByteBuffer = writerByteBuffer.duplicate();
     }
 
     @Nonnull
-    public ByteBuffer getWriterByteBuffer() {
-        return writerByteBuffer;
+    public ByteBuffer getByteBuffer() {
+        return byteBuffer;
     }
 
     @Nonnull
-    public ByteBuffer getReaderByteBuffer() {
-        return readerByteBuffer;
+    public ByteBuffer getDuplicateByteBuffer() {
+        return duplicateByteBuffer;
     }
 }

@@ -5,7 +5,7 @@ import javax.annotation.Nonnull;
 public interface Pool<T> {
 
     @Nonnull
-    T borrow();
+    T borrow() throws InterruptedException;
 
     void reclaim(@Nonnull T value);
 }
