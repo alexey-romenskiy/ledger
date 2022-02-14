@@ -2,27 +2,34 @@ package codes.writeonce.ledger;
 
 import javax.annotation.Nonnull;
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class BlockBuffer {
 
+    /**
+     * For writing to buffer.
+     */
     @Nonnull
-    private final ByteBuffer writerByteBuffer;
+    public final ByteBuffer writeBuffer;
 
+    /**
+     * For writing to disk.
+     */
     @Nonnull
-    private final ByteBuffer readerByteBuffer;
+    public final ByteBuffer diskBuffer;
 
-    public BlockBuffer(@Nonnull ByteBuffer writerByteBuffer) {
-        this.writerByteBuffer = writerByteBuffer;
-        this.readerByteBuffer = writerByteBuffer.duplicate();
-    }
-
+    /**
+     * For cloning by subscribers.
+     */
     @Nonnull
-    public ByteBuffer getWriterByteBuffer() {
-        return writerByteBuffer;
-    }
+    public final ByteBuffer subscriberBuffer;
 
-    @Nonnull
-    public ByteBuffer getReaderByteBuffer() {
-        return readerByteBuffer;
+    public final AtomicInteger refCount = new AtomicInteger(1);
+
+    public BlockBuffer(@Nonnull ByteBuffer writeBuffer, @Nonnull ByteBuffer diskBuffer,
+            @Nonnull ByteBuffer subscriberBuffer) {
+        this.writeBuffer = writeBuffer;
+        this.diskBuffer = diskBuffer;
+        this.subscriberBuffer = subscriberBuffer;
     }
 }

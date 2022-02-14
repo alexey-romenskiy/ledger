@@ -4,40 +4,30 @@ import javax.annotation.Nonnull;
 import java.nio.ByteBuffer;
 import java.util.zip.CRC32;
 
-import static java.util.Objects.requireNonNull;
+import static codes.writeonce.ledger.MessageWriter.HEADER_SIZE;
+import static codes.writeonce.ledger.MessageWriter.TRAILER_SIZE;
 
-public class ChunkReader {
-
-    private static final int MAX_CHUNK_DATA_SIZE = 0x3fff;
+public class MessageReader {
 
     private final CRC32 checksum = new CRC32();
 
-    private final int capacity;
+    private final int blockSize;
 
-    @Nonnull
-    private final Receiver receiver;
-
-    public ChunkReader(int capacity, @Nonnull Receiver receiver) {
-
-        if (capacity < 23) {
-            throw new IllegalArgumentException();
-        }
-
-        this.capacity = capacity;
-        this.receiver = requireNonNull(receiver);
+    public MessageReader(int blockSize) {
+        this.blockSize = blockSize;
     }
 
-    public void next(@Nonnull ByteBuffer byteBuffer) {
+    public void next(@Nonnull ByteBuffer byteBuffer, @Nonnull MessageReceiver receiver) {
 
-        if (byteBuffer.capacity() != capacity) {
+        if (byteBuffer.capacity() != blockSize) {
             throw new IllegalArgumentException();
         }
 
         byteBuffer.clear();
         var position = 0;
-        var remaining = capacity;
+        var remaining = blockSize;
 
-        while (remaining >= 14) {
+        while (remaining >= HEADER_SIZE + TRAILER_SIZE) {
             final var sequence = byteBuffer.getLong(position);
             if (sequence == 0) {
                 break;
@@ -46,9 +36,8 @@ public class ChunkReader {
                 throw new IllegalArgumentException();
             }
             final var offset = byteBuffer.getLong(position + 8);
-            final var field = byteBuffer.getShort(position + 16);
-            final var length = field & MAX_CHUNK_DATA_SIZE;
-            final var dataPosition = position + 18;
+            final var length = byteBuffer.getShort(position + 16) & 0xFFFF;
+            final var dataPosition = position + HEADER_SIZE;
             final var checksumPosition = dataPosition + length;
             final var storedChecksum = byteBuffer.getInt(checksumPosition);
             byteBuffer.limit(checksumPosition);
@@ -67,11 +56,11 @@ public class ChunkReader {
             if (byteBuffer.limit() != checksumPosition) {
                 throw new IllegalArgumentException();
             }
-            if (byteBuffer.position() != byteBuffer.limit()) {
+            if (byteBuffer.position() != checksumPosition) {
                 throw new IllegalArgumentException();
             }
-            byteBuffer.limit(capacity);
-            final var chunkSize = 22 + length;
+            byteBuffer.limit(blockSize);
+            final var chunkSize = HEADER_SIZE + TRAILER_SIZE + length;
             position += chunkSize;
             remaining -= chunkSize;
         }
