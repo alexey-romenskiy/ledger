@@ -114,6 +114,20 @@ public class MessageWriter {
         adjust();
     }
 
+    public void abort() {
+
+        if (messageFinished) {
+            throw new IllegalStateException();
+        }
+
+        if (messageLength == 0) {
+            throw new IllegalStateException();
+        }
+
+        messageLength = 0;
+        messageFinished = true;
+    }
+
     public void sequence(long nextSequence) {
 
         if (!messageFinished) {
