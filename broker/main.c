@@ -12,9 +12,11 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "utils.h"
 #include "disruptor.h"
+#include "futex.h"
 
 #define MAX_REQUESTS 0x10000
 
@@ -190,9 +192,174 @@ void randomize(void *mapAddr, uint64_t writeSize) {
 //    printf("Randomized\n");
 
 //    printf("delta %ld\n", elapsed(&t));
+
+    sleep(1);
+
+    uint64_t end = writeSize / PAGE_SIZE / 2 * PAGE_SIZE;
+
+    for (int i = 0; i < 5; i++) {
+        startTime(&t);
+        memcpy(mapAddr + end, mapAddr, end);
+        printf("cpy %ld\n", elapsed2(t) / (end / PAGE_SIZE));
+    }
 }
 
+long counter = 0;
+pid_t lastPid;
+
+pthread_mutex_t mutex;
+pthread_cond_t cond;
+
+sigset_t set;
+
+void action(int sig, siginfo_t *info, void *ucontext) {
+
+
+    if (info->si_code == SI_USER) {
+        long i = atomic_load_explicit(&counter, memory_order_acquire);
+        long n = i + 1;
+        lastPid = info->si_pid;
+        while (!atomic_compare_exchange_strong(&counter, &i, n));
+        sigaddset(&((ucontext_t *) ucontext)->uc_sigmask, SIGUSR1);
+//        atomic_store_explicit(&counter, n, memory_order_release);
+//        pthread_mutex_lock(&mutex);
+//        pthread_cond_broadcast(&cond);
+//        pthread_mutex_unlock(&mutex);
+    } else if (info->si_code == SI_QUEUE) {
+        uint64_t value = (uint64_t) info->si_value.sival_ptr;
+    }
+}
+
+void action2(int sig, siginfo_t *info, void *ucontext) {
+
+    if (info->si_code == SI_USER) {
+        pthread_mutex_lock(&mutex);
+        pthread_cond_broadcast(&cond);
+        pthread_mutex_unlock(&mutex);
+    }
+}
+
+//#include <sys/types.h>
+//#include <sys/socket.h>
+//#include <sys/un.h>
+
+
 int main(int argc, char *argv[]) {
+
+    if (true) {
+        printf("pid: %d\n", getpid());
+
+        pthread_mutex_init(&mutex, NULL);
+        pthread_cond_init(&cond, NULL);
+
+        struct sigaction act;
+        memset(&act, 0, sizeof(act));
+        act.sa_flags = SA_SIGINFO;
+        act.sa_sigaction = &action2;
+        sigaction(SIGUSR1, &act, NULL);
+
+        int lock = pthread_mutex_lock(&mutex);
+        printf("Locked %d\n", lock);
+        int wait = pthread_cond_wait(&cond, &mutex);
+        printf("Unblock %d\n", wait);
+        pthread_mutex_unlock(&mutex);
+        // Do not unblock signal when mutex is acquired!
+        // The pending signal will cause deadlock if the handler will try to acquire this mutex!
+        return 0;
+    }
+
+    if (false) {
+        /*struct sockaddr_un client_sockaddr;
+        memset(&client_sockaddr, 0, sizeof(client_sockaddr));
+
+        socklen_t len = sizeof(client_sockaddr);
+        getpeername(0, &client_sockaddr, &len);*/
+
+        printf("pid: %d\n", getpid());
+
+        struct sigaction act;
+        memset(&act, 0, sizeof(act));
+        act.sa_flags = SA_SIGINFO;
+        act.sa_sigaction = &action;
+        sigaction(SIGUSR1, &act, NULL);
+
+        long i = atomic_load_explicit(&counter, memory_order_acquire);
+
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+
+//    sigset_t set2;
+//    sigprocmask(SIG_SETMASK, NULL, &set2);
+
+//    pthread_sigmask(SIG_BLOCK, &set, NULL);
+//    sigprocmask(SIG_BLOCK, &set, NULL);
+
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+//    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+//    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+        pthread_mutex_init(&mutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+
+        pthread_condattr_t attr2;
+        pthread_condattr_init(&attr2);
+//    pthread_condattr_setpshared(&attr2, PTHREAD_PROCESS_SHARED);
+        pthread_cond_init(&cond, &attr2);
+        pthread_condattr_destroy(&attr2);
+
+        /*printf("Lock\n");
+        int lock = pthread_mutex_lock(&mutex);
+        printf("Wait %d\n", lock);
+        int wait = pthread_cond_wait(&cond, &mutex);
+        printf("Unblock %d\n", wait);
+        pthread_mutex_unlock(&mutex);*/
+
+        while (true) {
+            while (true) {
+//        int sig;
+//        int r = sigwait(&set, &sig);
+//        printf("sigwait r=%d sig=%d\n", r, sig);
+                long n = atomic_load_explicit(&counter, memory_order_acquire);
+                if (n != i) {
+                    i = n;
+                    printf("Increment: %ld pid: %d\n", n, lastPid);
+                    break;
+                }
+            }
+
+            printf("Sleep\n");
+            sleep(10);
+            printf("Resume\n");
+
+//        sigprocmask(SIG_SETMASK, &set2, NULL);
+            sigset_t set2;
+            sigemptyset(&set2);
+            sigaddset(&set2, SIGUSR1);
+
+            pthread_sigmask(SIG_UNBLOCK, &set2, NULL);
+        }
+
+
+        if (false) {
+            pid_t pid = getpid();
+            kill(pid, SIGUSR1); // 0 or -1 is returned and errno
+            /* EINVAL An invalid signal was specified.
+               EPERM  The calling process does not have permission to send the signal to any of the target processes.
+               ESRCH  The target process or process group does not exist.  Note that an existing process might be a zombie, a process that has terminated execution, but has not yet been wait(2)ed for.
+               */
+
+            union sigval sv;
+            sv.sival_ptr = (void *) 123;
+            sigqueue(pid, SIGRTMIN, sv); // 0 or -1 is returned and errno
+            /* EAGAIN The limit of signals which may be queued has been reached.  (See signal(7) for further information.)
+               EINVAL sig was invalid.
+               EPERM  The process does not have permission to send the signal to the receiving process.  For the required permissions, see kill(2).
+               ESRCH  No process has a PID matching pid.
+               */
+        }
+
+        /*pthread_sigmask()*/
+    }
 
     uint64_t writeSize = HUGE_PAGE_SIZE;
 //    uint64_t writeSize = PAGE_SIZE;
