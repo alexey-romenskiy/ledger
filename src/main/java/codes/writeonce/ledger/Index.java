@@ -1,38 +1,38 @@
 package codes.writeonce.ledger;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nonnull;
+import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.ArrayList;
-import java.util.Arrays;
 
+import static java.nio.channels.FileChannel.MapMode.READ_WRITE;
 import static java.util.Objects.requireNonNull;
 
-public class Index {
+public class Index implements Closeable {
 
-    private final int blockSize;
+    protected final Logger logger = LoggerFactory.getLogger(getClass());
 
-    private final long fileBlockCount;
+    private final long topicId;
 
-    @Nonnull
-    private final FileChannel channel;
+    private final int fileBlockCount;
 
     private final int levelCount;
 
-    private final long[] levelOffsets;
-
-    private final ByteBuffer[] levelBuffers;
-
-    private final long[] levelBufferPosition;
-
-    private final boolean[] levelBufferDirty;
+    private final int[] levelOffsets;
 
     private final int blockItemCount;
 
-    private long firstFilledBlock;
+    private final MappedByteBuffer buffer;
 
-    private long filledBlockCount;
+    private int firstFilledBlock;
+
+    private int filledBlockCount;
 
     private long firstSequence;
 
@@ -54,7 +54,7 @@ public class Index {
 
         final var blockItemCount = blockSize / 16;
 
-        long total = 0;
+        long total = 1;
         var levelBlockCount = fileBlockCount;
         do {
             levelBlockCount = (levelBlockCount + blockItemCount - 1) / blockItemCount;
@@ -64,7 +64,7 @@ public class Index {
         return total * blockSize;
     }
 
-    public Index(int blockSize, long fileBlockCount, @Nonnull FileChannel channel) throws IOException {
+    public Index(long topicId, int blockSize, long fileBlockCount, @Nonnull FileChannel channel) throws IOException {
 
         if (blockSize < 16) {
             throw new IllegalArgumentException();
@@ -78,155 +78,191 @@ public class Index {
             throw new IllegalArgumentException();
         }
 
+        final var size = getSize(blockSize, fileBlockCount);
+        if (size > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException();
+        }
+
         requireNonNull(channel);
 
-        this.blockSize = blockSize;
-        this.fileBlockCount = fileBlockCount;
-        this.channel = channel;
+        if (fileBlockCount > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException();
+        }
+
+        this.topicId = topicId;
+
+        this.fileBlockCount = (int) fileBlockCount;
+        if (channel.size() < size) {
+            channel.write(ByteBuffer.allocate(1), size - 1);
+        }
+        buffer = channel.map(READ_WRITE, 0, size);
+        channel.close();
 
         blockItemCount = blockSize / 16;
-        int levelCount = 0;
-        final var levelOffsets = new ArrayList<Long>();
+        levelOffsets = getLevelOffsets(fileBlockCount, blockItemCount, blockSize);
+        levelCount = levelOffsets.length;
+
+        firstFilledBlock = buffer.getInt(0);
+        filledBlockCount = buffer.getInt(4);
+
+        if (firstFilledBlock < 0) {
+            throw new IllegalArgumentException();
+        }
+
+        if (firstFilledBlock >= fileBlockCount) {
+            throw new IllegalArgumentException();
+        }
+
+        if (filledBlockCount < 0) {
+            throw new IllegalArgumentException();
+        }
+
+        if (filledBlockCount > fileBlockCount) {
+            throw new IllegalArgumentException();
+        }
+
+        firstSequence = buffer.getLong(levelOffsets[0]);
+        firstOffset = buffer.getLong(levelOffsets[0] + 8);
+
+        logger.info("LEDGER#{}: Index initialized: firstFilledBlock={} filledBlockCount={}", topicId, firstFilledBlock,
+                filledBlockCount);
+    }
+
+    static int[] getLevelOffsets(long fileBlockCount, int blockItemCount, int blockSize) {
+
+        final var levelOffsets = new ArrayList<Integer>();
 
         var levelBlockCount = fileBlockCount;
         do {
             levelBlockCount = (levelBlockCount + blockItemCount - 1) / blockItemCount;
-            for (int i = 0; i < levelCount; i++) {
-                levelOffsets.set(i, levelOffsets.get(i) + levelBlockCount);
+            for (int i = 0; i < levelOffsets.size(); i++) {
+                levelOffsets.set(i, levelOffsets.get(i) + (int) levelBlockCount);
             }
-            levelOffsets.add(0, 0L);
-            levelCount++;
+            levelOffsets.add(0, 1);
         } while (levelBlockCount > 1);
 
-        this.levelCount = levelCount;
-        this.levelOffsets = levelOffsets.stream().mapToLong(e -> e).toArray();
-        this.levelBuffers = new ByteBuffer[levelCount];
-        for (int i = 0; i < levelCount; i++) {
-            levelBuffers[i] = ByteBuffer.allocate(blockSize);
-        }
-        this.levelBufferPosition = new long[levelCount];
-        this.levelBufferDirty = new boolean[levelCount];
-        Arrays.fill(this.levelBufferPosition, -1);
-        Arrays.fill(this.levelBufferDirty, false);
-
-        final var max = findMax();
-        final var min = findMin();
-        if (max == -1) {
-            if (min == -1) {
-                firstFilledBlock = 0;
-                filledBlockCount = 0;
-            } else {
-                throw new IllegalArgumentException();
-            }
-        } else {
-            if (min == -1) {
-                throw new IllegalArgumentException();
-            } else {
-                firstFilledBlock = min;
-                filledBlockCount = (max < min ? fileBlockCount + max - min : max - min) + 1;
-            }
-        }
-
-        final var byteBuffer = get(0, 0);
-        firstSequence = byteBuffer.getLong(0);
-        firstOffset = byteBuffer.getLong(8);
+        return levelOffsets.stream().mapToInt(e -> e * blockSize).toArray();
     }
 
-    private long findMin() throws IOException {
-        return findMinMax(1);
+    public long getFirstFilledBlock() {
+        return firstFilledBlock;
     }
 
-    private long findMax() throws IOException {
-        return findMinMax(-1);
+    public long getFilledBlockCount() {
+        return filledBlockCount;
     }
 
-    private long findMinMax(int sign) throws IOException {
-
-        long position = 0;
-        for (int level = 0; level < levelCount; level++) {
-            final var item = findMinMax2(sign, level, position);
-            if (item == -1) {
-                if (level == 0) {
-                    return -1;
-                } else {
-                    throw new IllegalArgumentException();
-                }
-            }
-            position = position * blockItemCount + item;
-        }
-        return position;
-    }
-
-    private long findMinMax2(int sign, int level, long position) throws IOException {
-
-        final var byteBuffer = get(level, position);
-        int i = 0;
-        while (i < blockItemCount) {
-            long minMaxSequence = byteBuffer.getLong(i * 16);
-            if (minMaxSequence != 0) {
-                long item = i;
-                long minMaxoffset = byteBuffer.getLong(i * 16 + 8);
-                i++;
-                while (i < blockItemCount) {
-                    final var s = byteBuffer.getLong(i * 16);
-                    final var o = byteBuffer.getLong(i * 16 + 8);
-                    if (s != 0) {
-                        final var sign1 = Long.compare(minMaxSequence, s);
-                        if (sign1 == 0) {
-                            final var sign2 = Long.compare(minMaxoffset, o);
-                            if (sign2 == 0) {
-                                throw new IllegalArgumentException();
-                            } else if (sign2 == sign) {
-                                minMaxoffset = o;
-                                item = i;
-                            }
-                        } else if (sign1 == sign) {
-                            minMaxSequence = s;
-                            minMaxoffset = o;
-                            item = i;
-                        }
-                    }
-                    i++;
-                }
-                return item;
-            }
-            i++;
-        }
-        return -1;
-    }
-
-    public void put(long blockNumber, long sequence, long offset) throws IOException {
+    /**
+     * Убрать блок из индекса.
+     */
+    public void remove(long blockNumber) {
 
         if (filledBlockCount == fileBlockCount) {
             if (blockNumber != firstFilledBlock) {
                 throw new IllegalArgumentException();
             }
-            firstFilledBlock = (firstFilledBlock + 1) % fileBlockCount;
         } else {
             if (filledBlockCount == 0) {
-                if (blockNumber != 0) {
-                    throw new IllegalArgumentException();
+                return;
+            } else {
+                final var end = (firstFilledBlock + filledBlockCount) % fileBlockCount;
+                if (end < firstFilledBlock) {
+                    if (blockNumber > firstFilledBlock || blockNumber < end) {
+                        throw new IllegalArgumentException();
+                    }
+                } else {
+                    if (blockNumber > firstFilledBlock && blockNumber < end) {
+                        throw new IllegalArgumentException();
+                    }
                 }
-                firstFilledBlock = blockNumber;
-            } else if (blockNumber != (firstFilledBlock + filledBlockCount) % fileBlockCount) {
-                throw new IllegalArgumentException();
+                if (blockNumber != firstFilledBlock) {
+                    return;
+                }
             }
-            filledBlockCount++;
         }
+        firstFilledBlock = (firstFilledBlock + 1) % fileBlockCount;
+        filledBlockCount--;
+        buffer.putInt(0, firstFilledBlock);
+        buffer.putInt(4, filledBlockCount);
 
-        int index;
         int level = levelCount;
-        long n = blockNumber;
+        int n = (int) blockNumber;
 
         while (true) {
             level--;
-            index = (int) (n % blockItemCount);
+            final var base = levelOffsets[level];
+            buffer.putLong(base + n * 16, 0);
+            buffer.putLong(base + n * 16 + 8, 0);
+            if (n % blockItemCount != 0) {
+                break;
+            }
+            if (level == 0) {
+                firstSequence = 0;
+                firstOffset = 0;
+                break;
+            }
             n /= blockItemCount;
-            final var byteBuffer = get(level, n);
-            byteBuffer.putLong(index * 16, sequence);
-            byteBuffer.putLong(index * 16 + 8, offset);
-            levelBufferDirty[level] = true;
-            if (index != 0) {
+        }
+    }
+
+    public void get(long blockNumber, @Nonnull Position position) {
+
+        final var base = levelOffsets[levelCount - 1] + (int) blockNumber * 16;
+        position.sequence = buffer.getLong(base);
+        position.offset = buffer.getLong(base + 8);
+    }
+
+    /**
+     * Записать в индекс, что в данном блоке первым является данный sequence/offset.
+     */
+    public void put(long blockNumber, long sequence, long offset) {
+
+        if (filledBlockCount == fileBlockCount) {
+            if (blockNumber != firstFilledBlock) {
+                throw new IllegalArgumentException(
+                        "Expected " + firstFilledBlock +
+                        " (firstFilledBlock=" + firstFilledBlock +
+                        " filledBlockCount=" + filledBlockCount +
+                        " fileBlockCount=" + fileBlockCount +
+                        "), but " + blockNumber + " encountered");
+            }
+            firstFilledBlock = (firstFilledBlock + 1) % fileBlockCount;
+            buffer.putInt(0, firstFilledBlock);
+        } else {
+            if (filledBlockCount == 0) {
+                if (blockNumber != 0) {
+                    throw new IllegalArgumentException(
+                            "Expected 0 (firstFilledBlock=" + firstFilledBlock +
+                            " filledBlockCount=" + filledBlockCount +
+                            " fileBlockCount=" + fileBlockCount +
+                            "), but " + blockNumber + " encountered");
+                }
+                firstFilledBlock = (int) blockNumber;
+                buffer.putInt(0, firstFilledBlock);
+            } else {
+                final var expectedBlockNumber = (firstFilledBlock + filledBlockCount) % fileBlockCount;
+                if (blockNumber != expectedBlockNumber) {
+                    throw new IllegalArgumentException(
+                            "Expected " + expectedBlockNumber +
+                            " (firstFilledBlock=" + firstFilledBlock +
+                            " filledBlockCount=" + filledBlockCount +
+                            " fileBlockCount=" + fileBlockCount +
+                            "), but " + blockNumber + " encountered");
+                }
+            }
+            filledBlockCount++;
+            buffer.putInt(4, filledBlockCount);
+        }
+
+        int level = levelCount;
+        int n = (int) blockNumber;
+
+        while (true) {
+            level--;
+            final var base = levelOffsets[level];
+            buffer.putLong(base + n * 16, sequence);
+            buffer.putLong(base + n * 16 + 8, offset);
+            if (n % blockItemCount != 0) {
                 break;
             }
             if (level == 0) {
@@ -234,17 +270,21 @@ public class Index {
                 firstOffset = offset;
                 break;
             }
+            n /= blockItemCount;
         }
     }
 
-    public long findBlock(long sequence, long offset) throws IOException {
+    /**
+     * Найти номер блока, в начале которого записан ближайший не превосходящий sequence/offset.
+     */
+    public long findBlock(long sequence, long offset) {
 
         if (filledBlockCount == 0) {
             return -1;
         }
 
-        var from = firstFilledBlock;
-        var to = (firstFilledBlock + filledBlockCount - 1) % fileBlockCount;
+        int from = firstFilledBlock;
+        int to = (firstFilledBlock + filledBlockCount - 1) % fileBlockCount;
 
         if (from > to) {
             final var sign = compareFisrt(sequence, offset);
@@ -257,30 +297,57 @@ public class Index {
             }
         }
 
+        final var signFrom = compare(levelOffsets[levelCount - 1], from, sequence, offset);
+        if (signFrom > 0) {
+            return -1;
+        } else if (signFrom == 0) {
+            return from;
+        }
+
         while (true) {
-            long position;
-            long fromItem = from;
-            long toItem = to;
+            int fromItem = from;
+            int toItem = to;
             int i = 1;
-            long levelFactor = 1;
+            int levelFactor = 1;
             while (true) {
-                position = fromItem / blockItemCount;
-                if (position == toItem / blockItemCount) {
-                    fromItem %= blockItemCount;
-                    toItem %= blockItemCount;
+                final int fromItem2 = fromItem / blockItemCount;
+                final int toItem2 = toItem / blockItemCount;
+                if (fromItem2 == toItem2) {
                     break;
+                }
+                final var r = fromItem % blockItemCount;
+                if (r == 0) {
+                    fromItem = fromItem2;
+                    toItem = toItem2;
+                } else {
+                    final var n = fromItem - r + blockItemCount;
+                    final var sign = compare(levelOffsets[levelCount - i], n, sequence, offset);
+                    if (sign < 0) {
+                        from = n * levelFactor;
+                        if (fromItem2 + 1 == toItem2) {
+                            fromItem = n;
+                            break;
+                        } else {
+                            fromItem = fromItem2 + 1;
+                            toItem = toItem2;
+                        }
+                    } else if (sign > 0) {
+                        toItem = n - 1;
+                        to = n * levelFactor - 1;
+                        break;
+                    } else {
+                        return (long) n * levelFactor;
+                    }
                 }
                 levelFactor *= blockItemCount;
                 i++;
             }
-            final var level = levelCount - i;
-            final var byteBuffer = get(level, position);
             int middleItem;
             while (true) {
-                middleItem = (int) ((fromItem + toItem + 1) / 2);
-                final int sign = compare(byteBuffer, middleItem, sequence, offset);
+                middleItem = (fromItem + toItem + 1) / 2;
+                final int sign = compare(levelOffsets[levelCount - i], middleItem, sequence, offset);
                 if (sign < 0) {
-                    from = (position * blockItemCount + middleItem) * levelFactor;
+                    from = middleItem * levelFactor;
                     if (middleItem == toItem) {
                         if (from == to) {
                             return from;
@@ -294,22 +361,22 @@ public class Index {
                         return -1;
                     } else {
                         toItem = middleItem - 1;
-                        to = (position * blockItemCount + middleItem) * levelFactor - 1;
+                        to = middleItem * levelFactor - 1;
                     }
                 } else {
-                    return (position * blockItemCount + middleItem) * levelFactor;
+                    return (long) middleItem * levelFactor;
                 }
             }
         }
     }
 
-    private int compare(@Nonnull ByteBuffer byteBuffer, int position, long sequence, long offset) {
+    private int compare(int base, int position, long sequence, long offset) {
 
-        final var s = byteBuffer.getLong(position * 16);
+        final var s = buffer.getLong(base + position * 16);
         if (s < sequence) {
             return -1;
         } else if (s == sequence) {
-            final var o = byteBuffer.getLong(position * 16 + 8);
+            final var o = buffer.getLong(base + position * 16 + 8);
             return Long.compare(o, offset);
         } else {
             return 1;
@@ -327,34 +394,8 @@ public class Index {
         }
     }
 
-    @Nonnull
-    private ByteBuffer get(int level, long position) throws IOException {
-
-        final var levelByteBuffer = levelBuffers[level];
-        levelByteBuffer.clear();
-        final var currentLevelBufferPosition = levelBufferPosition[level];
-        if (currentLevelBufferPosition != position) {
-            final var levelOffset = levelOffsets[level];
-            if (levelBufferDirty[level]) {
-                channel.write(levelByteBuffer, (levelOffset + currentLevelBufferPosition) * blockSize);
-                levelByteBuffer.clear();
-                levelBufferDirty[level] = false;
-            }
-            channel.read(levelByteBuffer, (levelOffset + position) * blockSize);
-            levelBufferPosition[level] = position;
-        }
-        return levelByteBuffer;
-    }
-
-    public void flush() throws IOException {
-
-        for (int level = 0; level < levelCount; level++) {
-            if (levelBufferDirty[level]) {
-                final var levelByteBuffer = levelBuffers[level];
-                levelByteBuffer.clear();
-                channel.write(levelByteBuffer, (levelOffsets[level] + levelBufferPosition[level]) * blockSize);
-                levelBufferDirty[level] = false;
-            }
-        }
+    @Override
+    public void close() {
+        // empty
     }
 }

@@ -5,7 +5,7 @@ import javax.annotation.Nonnull;
 public interface Pool<T> {
 
     @Nonnull
-    T borrow();
+    T acquire();
 
-    void reclaim(@Nonnull T value);
+    void release(@Nonnull T value);
 }

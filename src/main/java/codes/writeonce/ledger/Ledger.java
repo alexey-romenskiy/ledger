@@ -1,202 +1,150 @@
 package codes.writeonce.ledger;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.io.IOException;
-import java.nio.ByteBuffer;
+import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
-import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-
-import static java.nio.charset.StandardCharsets.UTF_8;
-import static java.nio.file.StandardOpenOption.CREATE_NEW;
-import static java.nio.file.StandardOpenOption.READ;
-import static java.nio.file.StandardOpenOption.WRITE;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Ledger implements AutoCloseable {
 
-    private static final int MAX_PID_LENGTH = 1000;
-    @Nonnull
-    private final Path ledgerPath;
+    protected final Logger logger = LoggerFactory.getLogger(getClass());
 
-    private final long ledgerByteOffset;
-
-    private final int ledgerBlockSizeBytes;
-
-    private final long ledgerBlockCount;
+    private final long topicId;
 
     @Nonnull
-    private final Path indexPath;
+    private final AtomicBoolean closed = new AtomicBoolean();
 
-    private final long indexByteOffset;
+    @Nonnull
+    private final MessageWriter messageWriter;
 
-    private final int indexBlockSizeBytes;
-
-    private final long indexBlockCount;
+    @Nonnull
+    private final BlockWriterImpl blockWriter;
 
     @Nonnull
     private final Path lockPath;
 
-    private FileChannel lockChannel;
+    @Nonnull
+    private final FileChannel lockChannel;
 
-    private FileLock fileLock;
-
-    private boolean opened;
+    @Nonnull
+    private final FileLock fileLock;
 
     public Ledger(
-            @Nonnull Path ledgerPath,
-            long ledgerByteOffset,
-            int ledgerBlockSizeBytes,
-            long ledgerBlockCount,
-            @Nonnull Path indexPath,
-            long indexByteOffset,
-            int indexBlockSizeBytes,
-            long indexBlockCount,
-            @Nonnull Path lockPath
+            long topicId,
+            @Nonnull MessageWriter messageWriter,
+            @Nonnull BlockWriterImpl blockWriter,
+            @Nonnull Path lockPath,
+            @Nonnull FileChannel lockChannel,
+            @Nonnull FileLock fileLock
     ) {
-        this.ledgerPath = ledgerPath;
-        this.ledgerByteOffset = ledgerByteOffset;
-        this.ledgerBlockSizeBytes = ledgerBlockSizeBytes;
-        this.ledgerBlockCount = ledgerBlockCount;
-        this.indexPath = indexPath;
-        this.indexByteOffset = indexByteOffset;
-        this.indexBlockSizeBytes = indexBlockSizeBytes;
-        this.indexBlockCount = indexBlockCount;
+        this.topicId = topicId;
+        this.messageWriter = messageWriter;
+        this.blockWriter = blockWriter;
         this.lockPath = lockPath;
+        this.lockChannel = lockChannel;
+        this.fileLock = fileLock;
     }
 
-    public void open() throws LedgerException {
-
-        try {
-            try {
-                lockChannel = FileChannel.open(lockPath, CREATE_NEW, WRITE);
-                fileLock = lockChannel.tryLock(0, Long.MAX_VALUE, false);
-                if (fileLock == null) {
-                    throw new LedgerException(); // occupied by another process
-                }
-                writePid(lockChannel);
-                openStorage();
-            } catch (FileAlreadyExistsException e) {
-                try {
-                    lockChannel = FileChannel.open(lockPath, READ, WRITE);
-                    fileLock = lockChannel.tryLock(0, Long.MAX_VALUE, false);
-                    if (fileLock == null) {
-                        throw new LedgerException(); // occupied by another process
-                    }
-                    if (isProcessAlive(readPid(lockChannel))) {
-                        throw new LedgerException();
-                    }
-                    lockChannel.truncate(0);
-                    writePid(lockChannel);
-                    rebuildIndex();
-                    openStorage();
-                } catch (IOException e2) {
-                    throw new LedgerException(e);
-                }
-            }
-            opened = true;
-        } catch (IOException e) {
-            // NoSuchFileException for incorrect file path
-            cleanup(e);
-            throw new LedgerException(e);
-        } catch (LedgerException e) {
-            cleanup(e);
-            throw e;
-        }
+    @Nonnull
+    public MessageWriter getMessageWriter() {
+        return messageWriter;
     }
 
-    private void openStorage() {
-        // TODO:
+    @Nonnull
+    public BlockWriterImpl getBlockWriter() {
+        return blockWriter;
     }
 
-    private void rebuildIndex() {
-        throw new UnsupportedOperationException();// TODO:
+    @Nullable
+    public Slot slot(long id) {
+        return blockWriter.slot(id);
     }
 
-    private static void writePid(@Nonnull FileChannel lockChannel) throws IOException {
-
-        lockChannel.write(ByteBuffer.wrap(String.valueOf(ProcessHandle.current().pid()).getBytes(UTF_8)), 0);
-        lockChannel.force(true);
+    public boolean deleteSlot(long id) {
+        return blockWriter.deleteSlot(id);
     }
 
-    private static boolean isProcessAlive(long pid) {
-        return ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false);
+    @Nonnull
+    public Slot createSlot() {
+        return blockWriter.createSlot();
     }
 
-    private static long readPid(@Nonnull FileChannel lockChannel) throws IOException, LedgerException {
-
-        final var size = lockChannel.size();
-        if (size == 0) {
-            throw new LedgerException();
-        }
-        if (size > MAX_PID_LENGTH) {
-            throw new LedgerException();
-        }
-        final var byteBuffer = ByteBuffer.allocate((int) size);
-        lockChannel.read(byteBuffer, 0);
-        byteBuffer.flip();
-        final var bytes = new byte[byteBuffer.limit()];
-        byteBuffer.get(bytes);
-        try {
-            return Long.parseLong(new String(bytes, UTF_8));
-        } catch (NumberFormatException e) {
-            throw new LedgerException();
-        }
+    @Nullable
+    public Slot createSlot(long sequence, long offset) {
+        return blockWriter.createSlot(sequence, offset);
     }
 
     @Override
-    public void close() throws LedgerException {
+    public void close() {
 
-        cleanup(null);
-
-        if (opened) {
-            opened = false;
-            try {
-                Files.delete(lockPath);
-            } catch (IOException e) {
-                throw new LedgerException(e);
+        if (blockWriter.close()) {
+            if (!closed.getAndSet(true)) {
+                try {
+                    try {
+                        Files.delete(lockPath);
+                    } catch (NoSuchFileException ignore) {
+                        // ignore
+                    }
+                    fileLock.close();
+                    lockChannel.close();
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
             }
+            logger.info("LEDGER#{}: Closed", topicId);
+        } else {
+            logger.error("LEDGER#{}: Not closed normally", topicId);
         }
     }
 
-    private void cleanup(@Nullable Throwable suppressed) throws LedgerException {
+    public long getTopicId() {
+        return topicId;
+    }
 
-        try {
-            if (fileLock != null) {
-                fileLock.close();
-            }
+    public long getBlockFilePosition() {
+        return blockWriter.getBlockFilePosition();
+    }
 
-            if (lockChannel != null) {
-                lockChannel.close();
-            }
-        } catch (Exception e) {
-            final var ledgerException = new LedgerException(e);
-            if (suppressed != null) {
-                ledgerException.addSuppressed(suppressed);
-            }
-            throw ledgerException;
-        }
+    public long getBlockFileRemained() {
+        return blockWriter.getBlockFileRemained();
+    }
+
+    public int getQueuePosition() {
+        return blockWriter.getQueuePosition();
     }
 
     @Nonnull
-    public Slot slot() {
-        return null;// TODO:
+    public Map<Long, Map<String, Object>> getSlotInfos() {
+        return blockWriter.getSlotInfos();
     }
 
-    @Nonnull
-    public Slot slot(long sequence, long offset) {
-        return null;// TODO:
+    public int getBlockSize() {
+        return blockWriter.getBlockSize();
     }
 
-    @Nonnull
-    public Watcher watch() {
-        return null;// TODO:
+    public int getQueueSize() {
+        return blockWriter.getQueueSize();
     }
 
-    @Nonnull
-    public Watcher watch(long sequence, long offset) {
-        return null;// TODO:
+    public int getQueueRemained() {
+        return blockWriter.getQueueRemained();
+    }
+
+    public long getFirstNeededBlockFilePosition() {
+        return blockWriter.getFirstNeededBlockFilePosition();
+    }
+
+    public long getBlockFileSize() {
+        return blockWriter.getBlockFileSize();
     }
 }

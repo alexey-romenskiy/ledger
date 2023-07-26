@@ -1,28 +1,78 @@
 package codes.writeonce.ledger;
 
+import codes.writeonce.concurrency.Bloom;
+
 import javax.annotation.Nonnull;
 import java.nio.ByteBuffer;
 
+/**
+ * blockSize >= availableDataLength >= writingSize >= stableSize >= 0
+ */
 public class BlockBuffer {
 
-    @Nonnull
-    private final ByteBuffer writerByteBuffer;
+    public int index = -1;
 
+    /**
+     * For writing to buffer.
+     */
     @Nonnull
-    private final ByteBuffer readerByteBuffer;
+    public final ByteBuffer writeBuffer;
 
-    public BlockBuffer(@Nonnull ByteBuffer writerByteBuffer) {
-        this.writerByteBuffer = writerByteBuffer;
-        this.readerByteBuffer = writerByteBuffer.duplicate();
-    }
-
+    /**
+     * For writing to disk.
+     */
     @Nonnull
-    public ByteBuffer getWriterByteBuffer() {
-        return writerByteBuffer;
-    }
+    public final ByteBuffer diskBuffer;
 
+    /**
+     * For cloning by subscribers.
+     */
     @Nonnull
-    public ByteBuffer getReaderByteBuffer() {
-        return readerByteBuffer;
+    public final ByteBuffer subscriberBuffer;
+
+    public int refCount = 1;
+
+    public boolean cached;
+
+    public final Bloom dataBloom = new Bloom();
+
+    public volatile int availableDataLength;
+
+    public volatile boolean readFailed;
+
+    public long blockFilePosition = -1;
+
+    public boolean writing;
+
+    public int writingSize;
+
+    public long writingStartNanos;
+
+    public volatile int stableSize;
+
+    public volatile Throwable writeFailed;
+
+    public final Bloom stabBloom = new Bloom();
+
+    public long readySequence;
+
+    public long readyOffset;
+
+    public long writingSequence;
+
+    public long writingOffset;
+
+    public long stableSequence;
+
+    public long stableOffset;
+
+    public BlockBuffer(
+            @Nonnull ByteBuffer writeBuffer,
+            @Nonnull ByteBuffer diskBuffer,
+            @Nonnull ByteBuffer subscriberBuffer
+    ) {
+        this.writeBuffer = writeBuffer;
+        this.diskBuffer = diskBuffer;
+        this.subscriberBuffer = subscriberBuffer;
     }
 }
