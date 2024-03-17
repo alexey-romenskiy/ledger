@@ -337,7 +337,7 @@ public class PeerSession implements SessionControl {
 
     private void drainBees(@Nonnull NioHive<String> hive) {
         for (var bee = hive.nextBee(); bee != null; bee = hive.nextBee()) {
-            logger.info("Bee returned: {}", bee.value());
+            // TODO: logger.info("Bee returned: {}", bee.value());
             bee.close();
         }
     }

@@ -33,6 +33,16 @@ public class BufferPool implements Pool<BlockBuffer> {
         }
     }
 
+    public int available() {
+
+        while (true) {
+            final var i = index.get();
+            if (i != -1) {
+                return pool.length - i;
+            }
+        }
+    }
+
     @Nonnull
     public BlockBuffer acquire() {
 

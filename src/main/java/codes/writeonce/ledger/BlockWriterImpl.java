@@ -65,7 +65,7 @@ public class BlockWriterImpl implements BlockWriter {
     private final BlockBuffer[] queue;
 
     @Nonnull
-    private final Pool<BlockBuffer> blockBufferPool;
+    final BufferPool blockBufferPool;
 
     @Nonnull
     private final AtomicReference<Thread> writerThread = new AtomicReference<>();
@@ -150,7 +150,7 @@ public class BlockWriterImpl implements BlockWriter {
 
     public BlockWriterImpl(
             long topicId,
-            @Nonnull final Pool<BlockBuffer> blockBufferPool,
+            @Nonnull final BufferPool blockBufferPool,
             final int blockSize,
             final int maxCached,
             final long blockFilePosition,
@@ -363,6 +363,7 @@ public class BlockWriterImpl implements BlockWriter {
                 } else {
                     // swap out for subscribers
                     nextItem = blockBufferPool.acquire();
+                    logger.info("POOL: next block topicId={} available={}", topicId, blockBufferPool.available());
                     nextItem.index = nextQueuePosition;
                     queue[nextQueuePosition] = nextItem;
                 }
@@ -1170,6 +1171,8 @@ public class BlockWriterImpl implements BlockWriter {
             }
 
             index.close();
+        } catch (Throwable e) {
+            logger.error("LEDGER#{}: Indexer thread failed", topicId, e);
         } finally {
             indexCompleted = true;
             indexBloom.ready();

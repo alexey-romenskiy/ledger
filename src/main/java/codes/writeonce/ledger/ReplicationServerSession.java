@@ -426,7 +426,7 @@ public class ReplicationServerSession extends AbstractSessionListener {
             final var bee = c.prefetch(hive,
                     "prefetch-" + activeTopicId + "-" + activeSlotId + "-" + BEE_SEQUENCE.incrementAndGet());
             if (bee != null) {
-                logger.info("Bee created: {}", bee.value());
+                // TODO: logger.info("Bee created: {}", bee.value());
                 return true;
             }
             final var n = c.next(0, outboundBuffers, 1, outboundBuffers.length - 1);
@@ -456,7 +456,7 @@ public class ReplicationServerSession extends AbstractSessionListener {
             final var b = c.next(0, p, hive,
                     "update-" + activeTopicId + "-" + activeSlotId + "-" + BEE_SEQUENCE.incrementAndGet());
             if (b != null) {
-                logger.info("Bee created: {}", b.value());
+                // TODO: logger.info("Bee created: {}", b.value());
                 return true;
             }
         }

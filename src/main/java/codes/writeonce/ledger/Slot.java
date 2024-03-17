@@ -128,6 +128,8 @@ public class Slot {
         private final Thread currentThread;
 
         Cursor(long sequence, long offset, @Nonnull Thread currentThread) {
+            logger.info("POOL: cursor opened topicId={} slotId={} available={}", blockWriter.topicId, id,
+                    blockWriter.blockBufferPool.available());
             this.sequence = sequence;
             this.offset = offset;
             this.currentThread = currentThread;
@@ -162,6 +164,8 @@ public class Slot {
             try {
                 final var delta = blockWriter.getDelta(blockNumber);
                 countPrefetched = blockWriter.get(blockNumber, queue, 0, maxPrefetched, delta);
+                logger.info("POOL: cursor init topicId={} slotId={} available={}", blockWriter.topicId, id,
+                        blockWriter.blockBufferPool.available());
                 hitEnd = delta < maxPrefetched;
             } finally {
                 blockWriter.release();
@@ -319,6 +323,9 @@ public class Slot {
             blockWriter.clean(queue, currentPosition, n);
             currentPosition = (currentPosition + n) % maxPrefetched;
             queueUsed -= n;
+
+            logger.info("POOL: cursor skip topicId={} slotId={} available={}", blockWriter.topicId, id,
+                    blockWriter.blockBufferPool.available());
         }
 
         public int prefetched() {
@@ -464,6 +471,9 @@ public class Slot {
             } finally {
                 releasePosition();
             }
+
+            logger.info("POOL: cursor closed topicId={} slotId={} available={}", blockWriter.topicId, id,
+                    blockWriter.blockBufferPool.available());
         }
     }
 
@@ -534,6 +544,8 @@ public class Slot {
             try {
                 final var delta = blockWriter.getDelta(blockNumber);
                 countPrefetched = blockWriter.get(blockNumber, queue, 0, maxPrefetched, delta);
+                logger.info("POOL: cursor read topicId={} slotId={} available={}", blockWriter.topicId, id,
+                        blockWriter.blockBufferPool.available());
                 hitEnd = delta < maxPrefetched;
             } finally {
                 blockWriter.release();
@@ -629,6 +641,8 @@ public class Slot {
 
                 if (availableDataLength == blockSize) {
                     blockWriter.clean(queue, currentPosition, 1);
+                    logger.info("POOL: cursor clean topicId={} slotId={} available={}", blockWriter.topicId, id,
+                            blockWriter.blockBufferPool.available());
                     currentPosition = (currentPosition + 1) % maxPrefetched;
                     queueUsed--;
                     bufferPosition = 0;
@@ -677,6 +691,9 @@ public class Slot {
             } finally {
                 releasePosition();
             }
+
+            logger.info("POOL: cursor finished topicId={} slotId={} available={}", blockWriter.topicId, id,
+                    blockWriter.blockBufferPool.available());
         }
     }
 
@@ -695,6 +712,8 @@ public class Slot {
                         prefetchCount,
                         delta - 1
                 );
+                logger.info("POOL: cursor prefetch topicId={} slotId={} available={}", blockWriter.topicId, id,
+                        blockWriter.blockBufferPool.available());
                 hitEnd = delta <= prefetchCount;
                 queueUsed += countPrefetched;
                 blockFilePosition = (blockFilePosition + countPrefetched) % blockWriter.blockFileSize;
