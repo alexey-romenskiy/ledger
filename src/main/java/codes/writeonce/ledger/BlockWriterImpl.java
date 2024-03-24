@@ -362,6 +362,7 @@ public class BlockWriterImpl implements BlockWriter {
                     nextItem.writeBuffer.put(0, zeroes);
                 } else {
                     // swap out for subscribers
+                    nextItem.refCount--;
                     nextItem = blockBufferPool.acquire();
                     logger.info("POOL: next block topicId={} available={}", topicId, blockBufferPool.available());
                     nextItem.index = nextQueuePosition;
